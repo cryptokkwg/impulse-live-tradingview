@@ -1,0 +1,201 @@
+//@version=6
+indicator("XAUUSD • Impulse LIVE", shorttitle="Impulse LIVE", overlay=true, scale=scale.right, max_boxes_count=20, max_lines_count=30, max_labels_count=30)
+// Signals use only the current chart timeframe. LIVE previews can disappear.
+string g = "Sygnaly aktualnego interwalu"
+int breakout = input.int(2, "Wybicie ostatnich swiec", minval=1, maxval=20, group=g)
+float minBody = input.float(0.35, "Minimalny korpus / ATR", minval=0.1, step=0.05, group=g)
+bool reclaim = input.bool(true, "Takze impuls powrotu przez SMA 11", group=g)
+bool trendFilter = input.bool(false, "Dodatkowy filtr SMA 50", group=g)
+int cooldown = input.int(3, "Przerwa miedzy sygnalami (swiece)", minval=1, group=g)
+bool livePreview = input.bool(true, "Pokazuj LIVE przed zamknieciem (moze zniknac)", group=g)
+string r = "SL i cele"
+int swing = input.int(5, "Lokalna struktura SL (swiece)", minval=2, maxval=30, group=r)
+float buffer = input.float(0.1, "Bufor SL / ATR", minval=0.0, step=0.05, group=r)
+float maxRisk = input.float(3.0, "Maksymalna odleglosc SL / ATR", minval=0.5, step=0.25, group=r)
+float rr1 = input.float(1.0, "TP1 (R)", minval=0.1, group=r)
+float rr2 = input.float(2.0, "TP2 (R)", minval=0.1, group=r)
+float rr3 = input.float(3.0, "TP3 (R)", minval=0.1, group=r)
+if barstate.isfirst and (rr1 >= rr2 or rr2 >= rr3)
+    runtime.error("Ustaw rosnace cele: TP1 < TP2 < TP3.")
+int expiry = input.int(24, "Wygaszenie planu po N swiecach", minval=3, maxval=200, group=r)
+int width = input.int(18, "Szerokosc stref", minval=5, maxval=60, group="Wyglad")
+bool showMA = input.bool(true, "SMA 11 / 50 / 200", group="Wyglad")
+color buyColor = color.rgb(76,175,80)
+color sellColor = color.rgb(156,39,176)
+float ma11 = ta.sma(close,11)
+float ma50 = ta.sma(close,50)
+float ma200 = ta.sma(close,200)
+float atr = ta.atr(14)
+float atrBase = atr[1]
+float rs = ta.rsi(close,14)
+float prevHigh = ta.highest(high[1],breakout)
+float prevLow = ta.lowest(low[1],breakout)
+float localLow = ta.lowest(low,swing)
+float localHigh = ta.highest(high,swing)
+float buySL = math.min(localLow-buffer*atrBase,close-0.6*atrBase)
+float sellSL = math.max(localHigh+buffer*atrBase,close+0.6*atrBase)
+bool reclaimUp = reclaim and close[1] <= ma11[1] and close > ma11 and close > high[1]
+bool reclaimDown = reclaim and close[1] >= ma11[1] and close < ma11 and close < low[1]
+bool bull = close > open and close-open >= minBody*atrBase and close > ma11 and rs > 52 and (close > prevHigh or reclaimUp) and (not trendFilter or close > ma50)
+bool bear = close < open and open-close >= minBody*atrBase and close < ma11 and rs < 48 and (close < prevLow or reclaimDown) and (not trendFilter or close < ma50)
+type Plan
+    bool active = false
+    int side = 0
+    int born = na
+    int stamp = na
+    int id = 0
+    float entry = na
+    float stop = na
+    float risk = na
+    int reached = 0
+    string status = "Brak setupu"
+var Plan longPlan = Plan.new()
+var Plan shortPlan = Plan.new()
+var int nextId = 0
+bool ready = not longPlan.active and not shortPlan.active and chart.is_standard and not na(atrBase) and atrBase > 0
+bool buyCandidate = ready and not longPlan.active and (na(longPlan.born) or bar_index-longPlan.born >= cooldown) and bull and close-buySL <= maxRisk*atrBase
+bool sellCandidate = ready and not shortPlan.active and (na(shortPlan.born) or bar_index-shortPlan.born >= cooldown) and bear and sellSL-close <= maxRisk*atrBase
+bool buySignal = buyCandidate and barstate.isconfirmed
+bool sellSignal = sellCandidate and barstate.isconfirmed
+bool buyLive = livePreview and buyCandidate and not barstate.isconfirmed
+bool sellLive = livePreview and sellCandidate and not barstate.isconfirmed
+bool newSignal = buySignal or sellSignal
+// Only one active setup across both directions.
+type Sample
+    int side
+    int startBar
+    float sl
+    float tp
+var array<Sample> pending = array.new<Sample>()
+var int wins = 0
+var int losses = 0
+var int unclear = 0
+var int expiredSamples = 0
+var int totalSamples = 0
+var int firstSampleTime = na
+if barstate.isconfirmed
+    int i = array.size(pending)-1
+    while i >= 0
+        Sample s = array.get(pending,i)
+        bool tpHit = s.side == 1 ? high >= s.tp : low <= s.tp
+        bool slHit = s.side == 1 ? low <= s.sl : high >= s.sl
+        bool timedOut = bar_index-s.startBar >= expiry
+        if tpHit or slHit or timedOut
+            if tpHit and slHit
+                unclear += 1
+            else if tpHit
+                wins += 1
+            else if slHit
+                losses += 1
+            else
+                expiredSamples += 1
+            array.remove(pending,i)
+        i -= 1
+    // Enqueue AFTER evaluating previous signals: never credit entry-bar extremes.
+    if newSignal
+        int side = buySignal ? 1 : -1
+        float sampleSL = buySignal ? buySL : sellSL
+        float sampleTP = close+side*math.abs(close-sampleSL)*rr1
+        array.push(pending,Sample.new(side,bar_index,sampleSL,sampleTP))
+        totalSamples += 1
+        if na(firstSampleTime)
+            firstSampleTime := time_close
+// Each direction owns its immutable entry, stop and risk.
+if barstate.isconfirmed
+    for p in array.from(longPlan,shortPlan)
+        if p.active and bar_index > p.born
+            bool stopped = p.side == 1 ? low <= p.stop : high >= p.stop
+            float favorable = p.side == 1 ? high-p.entry : p.entry-low
+            int hit = favorable >= p.risk*rr3 ? 3 : favorable >= p.risk*rr2 ? 2 : favorable >= p.risk*rr1 ? 1 : 0
+            bool ambiguous = stopped and hit > p.reached
+            p.reached := math.max(p.reached,hit)
+            if stopped or p.reached == 3 or bar_index-p.born >= expiry
+                p.status := ambiguous ? "SL + TP: kolejnosc nieznana" : stopped ? "SL" : p.reached == 3 ? "TP3" : "Wygasl"
+                p.active := false
+            else
+                p.status := p.reached > 0 ? "TP"+str.tostring(p.reached)+" osiagniety" : "Oczekuje na TP / SL"
+if newSignal
+    Plan p = buySignal ? longPlan : shortPlan
+    nextId += 1
+    p.active := true
+    p.side := buySignal ? 1 : -1
+    p.born := bar_index
+    p.stamp := time_close
+    p.id := nextId
+    p.entry := close
+    p.stop := buySignal ? buySL : sellSL
+    p.risk := math.abs(p.entry-p.stop)
+    p.reached := 0
+    p.status := "Potwierdzony"
+plot(showMA ? ma11 : na, "SMA 11", color=color.purple)
+plot(showMA ? ma50 : na, "SMA 50", color=color.blue)
+plot(showMA ? ma200 : na, "SMA 200", color=color.red)
+plotshape(buySignal, title="BUY potwierdzony", style=shape.labelup, location=location.belowbar, color=buyColor, text="BUY", textcolor=color.white, size=size.tiny)
+plotshape(sellSignal, title="SELL potwierdzony", style=shape.labeldown, location=location.abovebar, color=sellColor, text="SELL", textcolor=color.white, size=size.tiny)
+plotshape(buyLive, title="BUY LIVE wstepny", style=shape.labelup, location=location.belowbar, color=color.new(buyColor,35), text="BUY\nLIVE", textcolor=color.white, size=size.small)
+plotshape(sellLive, title="SELL LIVE wstepny", style=shape.labeldown, location=location.abovebar, color=color.new(sellColor,35), text="SELL\nLIVE", textcolor=color.white, size=size.small)
+alertcondition(buySignal, "BUY potwierdzony", "BUY na {{ticker}} / {{interval}}, cena zamkniecia {{close}}. SL i TP na wykresie.")
+alertcondition(sellSignal, "SELL potwierdzony", "SELL na {{ticker}} / {{interval}}, cena zamkniecia {{close}}. SL i TP na wykresie.")
+var array<box> boxes = array.new<box>()
+var array<line> lines = array.new<line>()
+var array<label> labels = array.new<label>()
+f_price(float p) => str.tostring(p,format.mintick)
+f_level(int x1,int x2,float p,string caption,color c) =>
+    array.push(lines,line.new(x1,p,x2,p,color=c,width=2))
+    array.push(labels,label.new(x2,p,caption+"  "+f_price(p),style=label.style_label_left,color=color.new(c,10),textcolor=color.white,size=size.small))
+f_summary(Plan p) =>
+    p.id == 0 ? "Brak setupu" : "#"+str.tostring(p.id)+(p.active ? " AKTYWNY | " : " KONIEC | ")+p.status
+var table panel = table.new(position.bottom_left,2,11,bgcolor=color.new(color.rgb(17,24,39),8),frame_color=color.gray,frame_width=1)
+if barstate.islast
+    while array.size(boxes)>0
+        box.delete(array.pop(boxes))
+    while array.size(lines)>0
+        line.delete(array.pop(lines))
+    while array.size(labels)>0
+        label.delete(array.pop(labels))
+    int preview = buyLive ? 1 : sellLive ? -1 : 0
+    for p in array.from(longPlan,shortPlan)
+        if p.id > 0 and (p.active or p.id == nextId)
+            int d = p.side
+            float en = p.entry
+            float sl = p.stop
+            color c = d == 1 ? buyColor : sellColor
+            color dark = d == 1 ? color.rgb(27,94,32) : color.rgb(74,20,140)
+            int x1 = p.born
+            int x2 = x1+width
+            float t1 = en+d*p.risk*rr1
+            float t2 = en+d*p.risk*rr2
+            float t3 = en+d*p.risk*rr3
+            array.push(boxes,box.new(x1,math.max(en,t3),x2,math.min(en,t3),border_color=color.new(c,40),bgcolor=color.new(c,p.active ? 80 : 94)))
+            array.push(boxes,box.new(x1,math.max(en,sl),x2,math.min(en,sl),border_color=dark,bgcolor=color.new(dark,p.active ? 55 : 94)))
+            string side = (d == 1 ? "BUY" : "SELL")+" #"+str.tostring(p.id)
+            f_level(x1,x2,en,side+(p.active ? " ENTRY " : " ZAKONCZONY ")+str.format_time(p.stamp,"HH:mm","Europe/Warsaw"),c)
+            f_level(x1,x2,sl,side+" SL",dark)
+            f_level(x1,x2,t1,side+" TP1 | "+str.tostring(rr1)+"R",c)
+            f_level(x1,x2,t2,side+" TP2 | "+str.tostring(rr2)+"R",c)
+            f_level(x1,x2,t3,side+" TP3 | "+str.tostring(rr3)+"R",c)
+    string stateNow = not chart.is_standard ? "Uzyj zwyklych swiec" : preview != 0 ? (preview == 1 ? "BUY LIVE" : "SELL LIVE")+" - WSTEPNY" : longPlan.active and shortPlan.active ? "BUY + SELL: osobne plany" : longPlan.active ? "BUY aktywny" : shortPlan.active ? "SELL aktywny" : "WAIT"
+    table.cell(panel,0,0,"IMPULSE LIVE",text_color=color.white)
+    table.cell(panel,1,0,"TF wykresu: "+timeframe.period,text_color=color.aqua)
+    table.cell(panel,0,1,"TERAZ",text_color=color.silver)
+    table.cell(panel,1,1,stateNow,text_color=preview != 0 ? color.orange : color.white)
+    table.cell(panel,0,2,"BUY",text_color=buyColor)
+    table.cell(panel,1,2,f_summary(longPlan),text_color=color.white)
+    table.cell(panel,0,3,"SELL",text_color=sellColor)
+    table.cell(panel,1,3,f_summary(shortPlan),text_color=color.white)
+    table.cell(panel,0,4,"Cena / RSI 14",text_color=color.silver)
+    table.cell(panel,1,4,f_price(close)+" / "+str.tostring(rs,"#.0"),text_color=color.white)
+    table.cell(panel,0,5,"LIVE moze zniknac",text_color=color.orange)
+    table.cell(panel,1,5,"LIVE: tylko znacznik | setup zablokowany",text_color=color.silver)
+    int resolved = wins+losses
+    string winRate = resolved > 0 ? str.tostring(100.0*wins/resolved,"#.0")+"%" : "Brak rozstrzygnietych"
+    table.cell(panel,0,6,"SKUTECZNOSC TP1",text_color=color.aqua)
+    table.cell(panel,1,6,winRate+" | n="+str.tostring(resolved),text_color=color.aqua)
+    table.cell(panel,0,7,"Sukces / SL / wszystkie",text_color=color.silver)
+    table.cell(panel,1,7,str.tostring(wins)+" / "+str.tostring(losses)+" / "+str.tostring(totalSamples),text_color=color.white)
+    table.cell(panel,0,8,"Otwarte / wygasle / niejasne",text_color=color.silver)
+    table.cell(panel,1,8,str.tostring(array.size(pending))+" / "+str.tostring(expiredSamples)+" / "+str.tostring(unclear),text_color=color.white)
+    table.cell(panel,0,9,"Historia tego TF od",text_color=color.silver)
+    table.cell(panel,1,9,na(firstSampleTime) ? "Brak" : str.format_time(firstSampleTime,"yyyy-MM-dd HH:mm",syminfo.timezone),text_color=color.silver)
+    table.cell(panel,0,10,"TP1 przed SL / (TP1 + SL)",text_color=color.silver)
+    table.cell(panel,1,10,"Zamkniete swiece | bez kosztow",text_color=color.silver)
